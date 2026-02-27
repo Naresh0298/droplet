@@ -1,8 +1,9 @@
 """
-droplet-1B: Pre-training Data Preparation Pipeline
+droplet-1B: Pre-training Data Preparation Pipeline (Memory-Efficient)
 
 Streams text from 6 HuggingFace datasets, tokenizes with Llama 2 tokenizer,
-packs into fixed-length sequences, and saves as a memory-mapped binary file.
+packs into fixed-length sequences, and writes directly to a memory-mapped
+binary file. Never holds more than ~200MB in RAM.
 
 USAGE:
     # Test run (2 minutes)
@@ -80,11 +81,6 @@ DATASET_CONFIGS = [
 # ── TokenBuffer: Packs tokens into fixed-length chunks ───────────────
 
 class TokenBuffer:
-    """
-    Accumulates tokens from multiple documents and yields fixed-length chunks.
-    Adds EOS token between documents so the model learns document boundaries.
-    """
-
     def __init__(self, seq_len, eos_token_id):
         self.seq_len = seq_len
         self.eos_token_id = eos_token_id
@@ -92,12 +88,10 @@ class TokenBuffer:
         self.chunks_produced = 0
 
     def add_document(self, token_ids):
-        """Add a tokenized document to the buffer with EOS separator."""
         self.buffer.extend(token_ids)
         self.buffer.append(self.eos_token_id)
 
     def get_chunks(self):
-        """Extract all complete fixed-length chunks from the buffer."""
         chunks = []
         while len(self.buffer) >= self.seq_len:
             chunk = self.buffer[:self.seq_len]
@@ -106,113 +100,78 @@ class TokenBuffer:
             self.chunks_produced += 1
         return chunks
 
-    @property
-    def pending_tokens(self):
-        return len(self.buffer)
 
+# ── Process one dataset, writing directly to memmap ──────────────────
 
-# ── DatasetProcessor: Handles one dataset stream ─────────────────────
-
-class DatasetProcessor:
+def process_dataset(config, tokenizer, seq_len, fp, start_offset):
     """
-    Processes a single streaming dataset: loads it, tokenizes text,
-    and produces token chunks through a TokenBuffer.
+    Stream one dataset, tokenize, pack, and write chunks directly to
+    the memmap file. Returns the number of chunks written.
+    Memory-efficient: never holds more than one chunk in memory.
     """
+    buffer = TokenBuffer(seq_len, tokenizer.eos_token_id)
+    target_chunks = config["target_chunks"]
 
-    def __init__(self, config, tokenizer, seq_len):
-        self.config = config
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.buffer = TokenBuffer(seq_len, tokenizer.eos_token_id)
-        self.docs_processed = 0
-        self.tokens_produced = 0
+    load_kwargs = {
+        "path": config["hf_path"],
+        "split": "train",
+        "streaming": True,
+    }
+    if config["hf_name"]:
+        load_kwargs["name"] = config["hf_name"]
+    load_kwargs.update(config["hf_kwargs"])
+    dataset = load_dataset(**load_kwargs)
 
-    def stream_dataset(self):
-        """Open a streaming connection to the HuggingFace dataset."""
-        load_kwargs = {
-            "path": self.config["hf_path"],
-            "split": "train",
-            "streaming": True,
-        }
-        if self.config["hf_name"]:
-            load_kwargs["name"] = self.config["hf_name"]
-        load_kwargs.update(self.config["hf_kwargs"])
-        return load_dataset(**load_kwargs)
+    print(f"\n  Streaming {config['name']}...")
+    print(f"  Target: {config['target_tokens']:,} tokens ({target_chunks:,} chunks)")
 
-    def tokenize_text(self, text):
-        """Convert raw text to token IDs."""
-        return self.tokenizer.encode(text, add_special_tokens=False)
+    pbar = tqdm(total=target_chunks, desc=f"  {config['name']}", unit="chunks")
 
-    def process_documents(self, target_tokens):
-        """
-        Process documents until we've produced enough token chunks.
-        Streams data, tokenizes, packs into chunks, stops at target.
-        """
-        all_chunks = []
-        target_chunks = target_tokens // self.seq_len
-        dataset = self.stream_dataset()
+    chunks_written = 0
+    docs_processed = 0
+    offset = start_offset
 
-        print(f"\n  Streaming {self.config['name']}...")
-        print(f"  Target: {target_tokens:,} tokens ({target_chunks:,} chunks of {self.seq_len})")
+    for example in dataset:
+        text = example.get(config["text_field"], "")
 
-        pbar = tqdm(total=target_chunks, desc=f"  {self.config['name']}", unit="chunks")
+        if not text or len(text) < 50:
+            continue
+        if len(text) > 100_000:
+            text = text[:100_000]
 
-        for example in dataset:
-            text = example.get(self.config["text_field"], "")
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) < 10:
+            continue
 
-            # Skip empty or very short documents
-            if not text or len(text) < 50:
-                continue
+        buffer.add_document(token_ids)
+        chunks = buffer.get_chunks()
 
-            # Truncate extremely long documents
-            if len(text) > 100_000:
-                text = text[:100_000]
-
-            token_ids = self.tokenize_text(text)
-
-            # Skip if tokenization produced very few tokens
-            if len(token_ids) < 10:
-                continue
-
-            # Add to buffer and extract any complete chunks
-            self.buffer.add_document(token_ids)
-            chunks = self.buffer.get_chunks()
-
-            if chunks:
-                all_chunks.extend(chunks)
-                self.docs_processed += 1
-                self.tokens_produced += sum(len(c) for c in chunks)
-                pbar.update(len(chunks))
-
-            # Check if we've reached our target
-            if len(all_chunks) >= target_chunks:
+        for chunk in chunks:
+            if chunks_written >= target_chunks:
                 break
+            fp[offset:offset + seq_len] = chunk
+            offset += seq_len
+            chunks_written += 1
+            pbar.update(1)
 
-        pbar.close()
+        if chunks:
+            docs_processed += 1
 
-        # Trim to exactly the target number of chunks
-        all_chunks = all_chunks[:target_chunks]
+        if chunks_written >= target_chunks:
+            break
 
-        print(f"  Produced {len(all_chunks):,} chunks "
-              f"({len(all_chunks) * self.seq_len:,} tokens) "
-              f"from {self.docs_processed:,} documents")
+    pbar.close()
 
-        return all_chunks
+    print(f"  Produced {chunks_written:,} chunks "
+          f"({chunks_written * seq_len:,} tokens) "
+          f"from {docs_processed:,} documents")
+
+    return chunks_written
 
 
 # ── Main Pipeline ────────────────────────────────────────────────────
 
 def prepare_data(args):
-    """
-    Main data preparation pipeline.
-    1. Initialize tokenizer
-    2. Calculate token targets per dataset
-    3. Process each dataset (stream -> tokenize -> pack)
-    4. Shuffle chunks
-    5. Write to memory-mapped binary file
-    6. Save metadata and verify
-    """
-
     print("=" * 70)
     print("  droplet-1B Data Preparation Pipeline")
     print("=" * 70)
@@ -224,92 +183,104 @@ def prepare_data(args):
     vocab_size = tokenizer.vocab_size
     print(f"  Vocab size: {vocab_size:,}")
     print(f"  EOS token ID: {tokenizer.eos_token_id}")
-    assert vocab_size <= 65535, (
-        f"Vocab size {vocab_size} exceeds uint16 max (65535). "
-        f"Use int32 dtype instead."
-    )
-    print(f"  Vocab fits in uint16 (max 65535)")
+    assert vocab_size <= 65535, f"Vocab size {vocab_size} exceeds uint16 max"
 
     # Step 2: Calculate token targets
     print(f"\nToken allocation ({args.total_tokens:,} total):")
+    total_chunks = 0
     for config in DATASET_CONFIGS:
         config["target_tokens"] = int(args.total_tokens * config["weight"])
+        config["target_chunks"] = config["target_tokens"] // args.seq_len
+        total_chunks += config["target_chunks"]
         print(f"  {config['name']:25s}: {config['target_tokens']:>15,} tokens ({config['weight']*100:.0f}%)")
 
-    total_weight = sum(c["weight"] for c in DATASET_CONFIGS)
-    assert abs(total_weight - 1.0) < 0.01, f"Weights sum to {total_weight}, not 1.0"
+    total_tokens_planned = total_chunks * args.seq_len
 
-    # Step 3: Process each dataset
-    print(f"\n{'='*70}")
-    print(f"  Processing {len(DATASET_CONFIGS)} datasets...")
-    print(f"{'='*70}")
-
-    all_chunks = []
-    dataset_stats = {}
-    start_time = time.time()
-
-    for config in DATASET_CONFIGS:
-        ds_start = time.time()
-        processor = DatasetProcessor(config, tokenizer, args.seq_len)
-        chunks = processor.process_documents(config["target_tokens"])
-        all_chunks.extend(chunks)
-
-        ds_time = time.time() - ds_start
-        dataset_stats[config["name"]] = {
-            "chunks": len(chunks),
-            "tokens": len(chunks) * args.seq_len,
-            "docs": processor.docs_processed,
-            "time_seconds": ds_time,
-        }
-
-    total_time = time.time() - start_time
-    print(f"\nTotal processing time: {total_time/60:.1f} minutes")
-
-    # Step 4: Shuffle chunks
-    print(f"\nShuffling {len(all_chunks):,} chunks...")
-    np.random.seed(42)
-    shuffle_indices = np.random.permutation(len(all_chunks))
-    all_chunks = [all_chunks[i] for i in shuffle_indices]
-    print(f"  Shuffled with seed=42 (reproducible)")
-
-    # Step 5: Write memory-mapped binary file
+    # Step 3: Pre-allocate memmap file on disk (no RAM needed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     output_file = output_dir / "train_tokens.bin"
-    total_tokens_actual = len(all_chunks) * args.seq_len
 
-    print(f"\nWriting {total_tokens_actual:,} tokens to {output_file}")
-    print(f"  File size: ~{total_tokens_actual * 2 / 1e9:.1f} GB")
+    print(f"\nPre-allocating {output_file}")
+    print(f"  {total_tokens_planned:,} tokens = {total_tokens_planned * 2 / 1e9:.1f} GB")
 
     fp = np.memmap(
         str(output_file),
         dtype=np.uint16,
         mode='w+',
-        shape=(total_tokens_actual,)
+        shape=(total_tokens_planned,)
     )
 
+    # Step 4: Process each dataset, writing directly to memmap
+    print(f"\n{'='*70}")
+    print(f"  Processing {len(DATASET_CONFIGS)} datasets...")
+    print(f"{'='*70}")
+
+    dataset_stats = {}
+    start_time = time.time()
     offset = 0
-    for chunk in tqdm(all_chunks, desc="  Writing"):
-        fp[offset:offset + args.seq_len] = chunk
-        offset += args.seq_len
+
+    for config in DATASET_CONFIGS:
+        ds_start = time.time()
+
+        chunks_written = process_dataset(
+            config, tokenizer, args.seq_len, fp, offset
+        )
+
+        offset += chunks_written * args.seq_len
+        ds_time = time.time() - ds_start
+
+        dataset_stats[config["name"]] = {
+            "chunks": chunks_written,
+            "tokens": chunks_written * args.seq_len,
+            "time_seconds": round(ds_time, 1),
+        }
+
+        # Flush after each dataset to be safe
+        fp.flush()
+
+    del fp
+
+    total_time = time.time() - start_time
+    total_tokens_actual = offset
+    n_chunks = total_tokens_actual // args.seq_len
+    print(f"\nTotal processing time: {total_time/60:.1f} minutes")
+
+    # Step 5: Shuffle on disk using Fisher-Yates
+    # Only needs RAM for 2 chunks at a time (~8KB), not the whole file
+    print(f"\nShuffling {n_chunks:,} chunks on disk...")
+
+    fp = np.memmap(str(output_file), dtype=np.uint16, mode='r+')
+    seq = args.seq_len
+
+    rng = np.random.RandomState(42)
+    temp = np.empty(seq, dtype=np.uint16)
+
+    for i in tqdm(range(n_chunks - 1, 0, -1), desc="  Shuffling", unit="swaps",
+                  mininterval=2.0):
+        j = rng.randint(0, i + 1)
+        if i != j:
+            i_start = i * seq
+            j_start = j * seq
+            temp[:] = fp[i_start:i_start + seq]
+            fp[i_start:i_start + seq] = fp[j_start:j_start + seq]
+            fp[j_start:j_start + seq] = temp
 
     fp.flush()
     del fp
-
-    print(f"  Written to {output_file}")
+    print(f"  Shuffled with seed=42")
 
     # Step 6: Save metadata
     metadata = {
         "total_tokens": total_tokens_actual,
-        "total_chunks": len(all_chunks),
+        "total_chunks": n_chunks,
         "seq_len": args.seq_len,
         "dtype": "uint16",
         "vocab_size": vocab_size,
         "tokenizer_name": args.tokenizer_name,
         "datasets": dataset_stats,
         "file_size_bytes": total_tokens_actual * 2,
-        "file_size_gb": total_tokens_actual * 2 / 1e9,
+        "file_size_gb": round(total_tokens_actual * 2 / 1e9, 2),
         "shuffle_seed": 42,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -317,29 +288,20 @@ def prepare_data(args):
     metadata_file = output_dir / "data_config.json"
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=2)
-
     print(f"  Metadata saved to {metadata_file}")
 
-    # Step 7: Verification
-    print(f"\nVerifying output file...")
+    # Step 7: Verify
+    print(f"\nVerifying...")
     verify = np.memmap(str(output_file), dtype=np.uint16, mode='r')
-
-    assert len(verify) == total_tokens_actual, \
-        f"Size mismatch: {len(verify)} != {total_tokens_actual}"
-
-    max_token = verify.max()
-    assert max_token < vocab_size, \
-        f"Found token ID {max_token} >= vocab size {vocab_size}"
-
-    print(f"  File size: {len(verify):,} tokens")
-    print(f"  Max token ID: {max_token} (vocab: {vocab_size})")
+    assert len(verify) == total_tokens_actual
+    max_token = int(verify.max())
+    assert max_token < vocab_size, f"Token {max_token} >= vocab {vocab_size}"
+    print(f"  File: {len(verify):,} tokens, max_id={max_token}")
 
     sample_start = np.random.randint(0, len(verify) - 200)
     sample_tokens = verify[sample_start:sample_start + 50].astype(np.int64)
     sample_text = tokenizer.decode(sample_tokens)
-    print(f"\n  Random sample (tokens {sample_start}-{sample_start+50}):")
-    print(f'  "{sample_text[:200]}..."')
-
+    print(f'  Sample: "{sample_text[:150]}..."')
     del verify
 
     # Final summary
@@ -348,50 +310,27 @@ def prepare_data(args):
     print(f"{'='*70}")
     print(f"  Output file:     {output_file}")
     print(f"  Total tokens:    {total_tokens_actual:,}")
-    print(f"  Total chunks:    {len(all_chunks):,}")
-    print(f"  Sequence length: {args.seq_len}")
     print(f"  File size:       {total_tokens_actual * 2 / 1e9:.1f} GB")
     print(f"  Time taken:      {total_time/60:.1f} minutes")
     print(f"")
-    print(f"  Dataset breakdown:")
     for name, stats in dataset_stats.items():
-        print(f"    {name:25s}: {stats['tokens']:>12,} tokens from {stats['docs']:,} docs")
+        print(f"    {name:25s}: {stats['tokens']:>12,} tokens ({stats['time_seconds']:.0f}s)")
     print(f"")
-    print(f"  NEXT STEP:")
-    print(f"  1. Stop this CPU pod")
-    print(f"  2. Launch 4x RTX 4090 GPU pod with same network volume")
-    print(f"  3. Run: bash scripts/launch_pretrain.sh")
+    print(f"  NEXT: Stop CPU pod -> Launch 4x RTX 4090 -> bash scripts/launch_pretrain.sh")
     print(f"{'='*70}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="droplet-1B: Pre-training Data Preparation",
-    )
-
-    parser.add_argument(
-        "--output_dir", type=str, default="/workspace/data",
-        help="Directory to save tokenized data (default: /workspace/data)"
-    )
-    parser.add_argument(
-        "--tokenizer_name", type=str, default="NousResearch/Llama-2-7b-hf",
-        help="HuggingFace tokenizer name (default: NousResearch/Llama-2-7b-hf)"
-    )
-    parser.add_argument(
-        "--total_tokens", type=int, default=10_000_000_000,
-        help="Total tokens to prepare (default: 10B)"
-    )
-    parser.add_argument(
-        "--seq_len", type=int, default=2048,
-        help="Sequence length for packed chunks (default: 2048)"
-    )
+    parser = argparse.ArgumentParser(description="droplet-1B: Pre-training Data Preparation")
+    parser.add_argument("--output_dir", type=str, default="/workspace/data")
+    parser.add_argument("--tokenizer_name", type=str, default="NousResearch/Llama-2-7b-hf")
+    parser.add_argument("--total_tokens", type=int, default=10_000_000_000)
+    parser.add_argument("--seq_len", type=int, default=2048)
 
     args = parser.parse_args()
-
-    assert args.total_tokens > 0, "total_tokens must be positive"
-    assert args.seq_len > 0, "seq_len must be positive"
-    assert args.seq_len <= 8192, "seq_len > 8192 is unusual for pre-training"
+    assert args.total_tokens > 0
+    assert args.seq_len > 0
 
     prepare_data(args)
