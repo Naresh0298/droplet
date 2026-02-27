@@ -19,9 +19,6 @@ DATASET_CONFIGS = [
     "weight":0.50,
     },
     {
-        # WHY PYTHON SPECIFICALLY: Python is the most common language
-        # in tool-use (API calls, JSON, function signatures). JS adds
-        # web/API knowledge.
         "name": "StarCoder-Python",
         "hf_path": "bigcode/starcoderdata",
         "hf_name": None,
