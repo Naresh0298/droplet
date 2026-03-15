@@ -6,10 +6,7 @@ packs into fixed-length sequences, and writes directly to a memory-mapped
 binary file. Never holds more than ~200MB in RAM.
 
 USAGE:
-    # Test run (2 minutes)
     python prepare_pretrain.py --total_tokens 100_000_000 --output_dir /workspace/data
-
-    # Full run (2-3 hours)
     python prepare_pretrain.py --total_tokens 10_000_000_000 --output_dir /workspace/data
 """
 
@@ -17,6 +14,7 @@ import os
 import argparse
 import json
 import time
+import gc
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -107,7 +105,6 @@ def process_dataset(config, tokenizer, seq_len, fp, start_offset):
     """
     Stream one dataset, tokenize, pack, and write chunks directly to
     the memmap file. Returns the number of chunks written.
-    Memory-efficient: never holds more than one chunk in memory.
     """
     buffer = TokenBuffer(seq_len, tokenizer.eos_token_id)
     target_chunks = config["target_chunks"]
@@ -129,42 +126,65 @@ def process_dataset(config, tokenizer, seq_len, fp, start_offset):
 
     chunks_written = 0
     docs_processed = 0
+    errors = 0
     offset = start_offset
 
-    for example in dataset:
-        text = example.get(config["text_field"], "")
+    try:
+        for example in dataset:
+            try:
+                text = example.get(config["text_field"], "")
 
-        if not text or len(text) < 50:
-            continue
-        if len(text) > 100_000:
-            text = text[:100_000]
+                if not text or len(text) < 50:
+                    continue
+                if len(text) > 100_000:
+                    text = text[:100_000]
 
-        token_ids = tokenizer.encode(text, add_special_tokens=False)
-        if len(token_ids) < 10:
-            continue
+                token_ids = tokenizer.encode(text, add_special_tokens=False)
+                if len(token_ids) < 10:
+                    continue
 
-        buffer.add_document(token_ids)
-        chunks = buffer.get_chunks()
+                buffer.add_document(token_ids)
+                chunks = buffer.get_chunks()
 
-        for chunk in chunks:
-            if chunks_written >= target_chunks:
-                break
-            fp[offset:offset + seq_len] = chunk
-            offset += seq_len
-            chunks_written += 1
-            pbar.update(1)
+                for chunk in chunks:
+                    if chunks_written >= target_chunks:
+                        break
+                    fp[offset:offset + seq_len] = chunk
+                    offset += seq_len
+                    chunks_written += 1
+                    pbar.update(1)
 
-        if chunks:
-            docs_processed += 1
+                if chunks:
+                    docs_processed += 1
 
-        if chunks_written >= target_chunks:
-            break
+                # Periodic garbage collection and flush
+                if docs_processed % 10000 == 0 and docs_processed > 0:
+                    fp.flush()
+                    gc.collect()
+
+                if chunks_written >= target_chunks:
+                    break
+
+            except Exception as e:
+                errors += 1
+                if errors <= 5:
+                    print(f"\n  Warning: Error processing doc #{docs_processed}: {e}")
+                if errors > 1000:
+                    print(f"\n  Too many errors ({errors}), stopping this dataset")
+                    break
+                continue
+
+    except Exception as e:
+        print(f"\n  Dataset stream error: {e}")
+        print(f"  Got {chunks_written:,} chunks before error")
 
     pbar.close()
+    fp.flush()
 
     print(f"  Produced {chunks_written:,} chunks "
           f"({chunks_written * seq_len:,} tokens) "
-          f"from {docs_processed:,} documents")
+          f"from {docs_processed:,} documents"
+          f" ({errors} errors skipped)")
 
     return chunks_written
 
@@ -196,7 +216,7 @@ def prepare_data(args):
 
     total_tokens_planned = total_chunks * args.seq_len
 
-    # Step 3: Pre-allocate memmap file on disk (no RAM needed)
+    # Step 3: Pre-allocate memmap file on disk
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "train_tokens.bin"
@@ -236,9 +256,10 @@ def prepare_data(args):
             "time_seconds": round(ds_time, 1),
         }
 
-        # Flush after each dataset to be safe
-        fp.flush()
+        # Force cleanup between datasets
+        gc.collect()
 
+    fp.flush()
     del fp
 
     total_time = time.time() - start_time
@@ -246,8 +267,27 @@ def prepare_data(args):
     n_chunks = total_tokens_actual // args.seq_len
     print(f"\nTotal processing time: {total_time/60:.1f} minutes")
 
+    # Handle case where we got fewer tokens than planned
+    if total_tokens_actual < total_tokens_planned:
+        print(f"\nNote: Got {total_tokens_actual:,} tokens (planned {total_tokens_planned:,})")
+        print(f"  Truncating file to actual size...")
+        # Rewrite the file with correct size
+        old_fp = np.memmap(str(output_file), dtype=np.uint16, mode='r')
+        tmp_file = output_dir / "train_tokens_tmp.bin"
+        new_fp = np.memmap(str(tmp_file), dtype=np.uint16, mode='w+', shape=(total_tokens_actual,))
+        # Copy in chunks to save memory
+        copy_chunk = 1_000_000
+        for i in range(0, total_tokens_actual, copy_chunk):
+            end = min(i + copy_chunk, total_tokens_actual)
+            new_fp[i:end] = old_fp[i:end]
+        new_fp.flush()
+        del old_fp
+        del new_fp
+        os.remove(str(output_file))
+        os.rename(str(tmp_file), str(output_file))
+        print(f"  Truncated to {total_tokens_actual:,} tokens")
+
     # Step 5: Shuffle on disk using Fisher-Yates
-    # Only needs RAM for 2 chunks at a time (~8KB), not the whole file
     print(f"\nShuffling {n_chunks:,} chunks on disk...")
 
     fp = np.memmap(str(output_file), dtype=np.uint16, mode='r+')
@@ -312,10 +352,10 @@ def prepare_data(args):
     print(f"  Total tokens:    {total_tokens_actual:,}")
     print(f"  File size:       {total_tokens_actual * 2 / 1e9:.1f} GB")
     print(f"  Time taken:      {total_time/60:.1f} minutes")
-    print(f"")
+    print()
     for name, stats in dataset_stats.items():
         print(f"    {name:25s}: {stats['tokens']:>12,} tokens ({stats['time_seconds']:.0f}s)")
-    print(f"")
+    print()
     print(f"  NEXT: Stop CPU pod -> Launch 4x RTX 4090 -> bash scripts/launch_pretrain.sh")
     print(f"{'='*70}")
 
