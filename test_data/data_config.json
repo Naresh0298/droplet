@@ -1,0 +1,44 @@
+{
+  "total_tokens": 9994240,
+  "total_chunks": 4880,
+  "seq_len": 2048,
+  "dtype": "uint16",
+  "vocab_size": 32000,
+  "tokenizer_name": "NousResearch/Llama-2-7b-hf",
+  "datasets": {
+    "FineWeb-Edu": {
+      "chunks": 2441,
+      "tokens": 4999168,
+      "time_seconds": 48.3
+    },
+    "StarCoder-Python": {
+      "chunks": 585,
+      "tokens": 1198080,
+      "time_seconds": 11.9
+    },
+    "StarCoder-JavaScript": {
+      "chunks": 390,
+      "tokens": 798720,
+      "time_seconds": 10.4
+    },
+    "Wikipedia-EN": {
+      "chunks": 732,
+      "tokens": 1499136,
+      "time_seconds": 13.2
+    },
+    "UltraData-Math": {
+      "chunks": 488,
+      "tokens": 999424,
+      "time_seconds": 37.5
+    },
+    "OpenWebMath": {
+      "chunks": 244,
+      "tokens": 499712,
+      "time_seconds": 8.9
+    }
+  },
+  "file_size_bytes": 19988480,
+  "file_size_gb": 0.02,
+  "shuffle_seed": 42,
+  "created_at": "2026-03-15 17:21:28"
+}
